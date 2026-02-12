@@ -10,15 +10,13 @@ A Shell Script tool for easily querying AWS Bedrock usage by model, user, and co
 
 | 커맨드 / Command | 설명 / Description |
 |---|---|
-| `summary` | 기간 내 전체 요약 (호출 수, 토큰, 활성 모델 수) / Overall summary (invocations, tokens, active models) |
-| `models` | 모델별 호출·토큰 상세 / Per-model invocation & token breakdown |
-| `users` | 사용자별 호출 횟수 및 주 사용 모델 / Per-user invocation count & top model |
-| `trend` | 일별 호출·토큰 추이 (바 차트 포함) / Daily invocation & token trend with bar chart |
+| `overview` | 전체 요약 + 모델별 상세 + 일별 추이를 한 번에 조회 / Summary + per-model breakdown + daily trend in one pass |
+| `users` | 사용자별 호출 횟수, 주 사용 모델, 클라이언트 분석 / Per-user invocations, top model & client |
 | `cost` | 일별/월별 Bedrock 비용 분석 / Daily/monthly cost breakdown |
 
 ### 데이터 소스 / Data Sources
 
-- **summary, models, trend** — CloudWatch Metrics (`AWS/Bedrock` 네임스페이스)
+- **overview** — CloudWatch Metrics (`AWS/Bedrock` 네임스페이스)
 - **users** — CloudTrail (`InvokeModel`, `InvokeModelWithResponseStream`, `ConverseStream` 이벤트)
 - **cost** — AWS Cost Explorer (`BlendedCost`, `USAGE_TYPE` 기준 그룹핑)
 
@@ -34,6 +32,9 @@ A Shell Script tool for easily querying AWS Bedrock usage by model, user, and co
 ```bash
 # macOS에서 설치 / Install on macOS
 brew install awscli jq bc
+
+# Linux (Debian/Ubuntu)
+sudo apt install awscli jq bc
 ```
 
 ---
@@ -70,11 +71,14 @@ Or copy the files directly and grant execute permission.
 
 ## 실행 예시 / Examples
 
-### summary — 전체 요약 / Overall Summary
+### overview — 전체 현황 / Full Overview
+
+요약, 모델별 상세, 일별 추이를 한 번의 API 조회로 출력합니다.
+Shows summary, per-model breakdown, and daily trend in a single API pass.
 
 ```bash
-./bedrock-usage.sh summary
-./bedrock-usage.sh summary --days 30
+./bedrock-usage.sh overview
+./bedrock-usage.sh overview --days 14
 ```
 
 ```
@@ -84,26 +88,32 @@ Or copy the files directly and grant execute permission.
   Total Input Tokens:          413,130
   Total Output Tokens:       1,622,971
   Active Models:                     6
-```
 
-### models — 모델별 상세 / Per-Model Breakdown
-
-```bash
-./bedrock-usage.sh models
-./bedrock-usage.sh models --days 14
-```
-
-```
 Model                                   Invocations    Input Tokens    Output Tokens
-────────────────────────────────────────────────────────────────────────────────────────
-claude-opus-4-6                             1,234         234,567          890,123
-claude-sonnet-4-5                             890         123,456          456,789
-claude-haiku-4-5                              540          45,678          198,765
-────────────────────────────────────────────────────────────────────────────────────────
-TOTAL                                       2,964         413,130        1,622,971
+──────────────────────────────────────────────────────────────────────────────────────
+claude-opus-4-6                         1,215          5,618           868,329
+claude-sonnet-4-5                       1,087          8,275           599,360
+claude-haiku-4-5                        387            389,040         46,477
+claude-opus-4-5                         166            1,628           67,553
+claude-3-5-haiku                        10             758             1,097
+──────────────────────────────────────────────────────────────────────────────────────
+TOTAL                                   2,964          413,130         1,622,971
+
+Date          Invocations    Input Tokens    Output Tokens
+────────────────────────────────────────────────────────────
+2026-02-05    123            415             107,347          ███
+2026-02-06    188            587             94,373           █████
+2026-02-07    484            2,384           593,115          ██████████████
+2026-02-08    614            4,422           296,714          █████████████████
+2026-02-09    379            3,542           156,475          ███████████
+2026-02-10    1,059          396,154         327,829          ██████████████████████████████
+2026-02-11    117            5,626           47,118           ███
 ```
 
 ### users — 사용자별 분석 / Per-User Analysis
+
+CloudTrail에서 사용자별 호출 횟수, 주 사용 모델, 클라이언트(claude-code, nodejs-sdk 등)를 분석합니다.
+Analyzes per-user invocations, top model, and client (claude-code, nodejs-sdk, etc.) from CloudTrail.
 
 ```bash
 ./bedrock-usage.sh users
@@ -113,33 +123,18 @@ TOTAL                                       2,964         413,130        1,622,9
 ```
 === Bedrock Usage by User (2026-02-05 ~ 2026-02-12) ===
 
-User                    Invocations   Top Model
-──────────────────────────────────────────────────────────
-sshyun                      2,100     claude-opus-4-6
-admin                         864     claude-sonnet-4-5
-──────────────────────────────────────────────────────────
-TOTAL                       2,964
+User                    Invocations   Top Model               Client
+──────────────────────────────────────────────────────────────────────────────
+alice                   1,449         claude-sonnet-4-5       nodejs-sdk
+bob                     1,022         claude-haiku-4-5        claude-code
+charlie                   516         claude-opus-4-6         claude-code
+──────────────────────────────────────────────────────────────────────────────
+TOTAL                   2,987
 ```
 
 > CloudTrail은 최근 90일까지만 조회할 수 있습니다. `--days 90` 초과 시 자동으로 90일로 제한됩니다.
 >
 > CloudTrail only supports the last 90 days. Values exceeding 90 are automatically capped.
-
-### trend — 일별 추이 / Daily Trend
-
-```bash
-./bedrock-usage.sh trend
-./bedrock-usage.sh trend --days 14
-```
-
-```
-Date          Invocations    Input Tokens    Output Tokens
-─────────────────────────────────────────────────────────────
-2026-02-05    312            45,678          178,901   ████████████
-2026-02-06    523            67,890          267,890   ████████████████████
-2026-02-07    489            62,345          245,678   ██████████████████
-...
-```
 
 ### cost — 비용 분석 / Cost Analysis
 
@@ -173,13 +168,13 @@ All subcommands support three output formats.
 
 ```bash
 # 사람이 읽기 좋은 테이블 (기본) / Human-readable table (default)
-./bedrock-usage.sh summary
+./bedrock-usage.sh overview
 
 # 프로그래밍 처리용 JSON / JSON for programmatic use
-./bedrock-usage.sh -o json summary
+./bedrock-usage.sh -o json overview
 
 # 스프레드시트 등으로 가져올 수 있는 CSV / CSV for spreadsheets
-./bedrock-usage.sh -o csv models > models.csv
+./bedrock-usage.sh -o csv overview > overview.csv
 ```
 
 ---
@@ -193,8 +188,8 @@ bedrock-usage/
 ├── lib/
 │   ├── common.sh         # 공용 유틸리티 (날짜 계산, 포매팅, 색상, 테이블 출력)
 │   │                     # Shared utilities (date calc, formatting, colors, table output)
-│   ├── metrics.sh        # CloudWatch 메트릭 조회 (summary, models, trend)
-│   │                     # CloudWatch metric queries (summary, models, trend)
+│   ├── metrics.sh        # CloudWatch 메트릭 조회 (overview)
+│   │                     # CloudWatch metric queries (overview)
 │   ├── cloudtrail.sh     # CloudTrail 사용자별 분석 (users)
 │   │                     # CloudTrail per-user analysis (users)
 │   └── cost.sh           # Cost Explorer 비용 조회 (cost)
@@ -230,6 +225,9 @@ The following IAM permissions are required.
 ---
 
 ## 참고사항 / Notes
+
+- macOS (BSD date)와 Linux (GNU date) 모두 지원합니다.
+  Supports both macOS (BSD date) and Linux (GNU date).
 
 - macOS 기본 bash (3.x)와 호환됩니다. 연관 배열(associative array)을 사용하지 않습니다.
   Compatible with macOS default bash (3.x). No associative arrays used.

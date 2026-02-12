@@ -15,6 +15,68 @@
 # Compatible with bash 3.x (macOS default). No associative arrays.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# short_client_name()
+# Extract a human-readable client name from a CloudTrail userAgent string.
+#
+# Examples:
+#   "claude-cli/2.1.38 (external, cli)"                  -> "claude-code"
+#   "aws-sdk-js/3.986.0 ... nodejs#22.22.0 ..."          -> "nodejs-sdk"
+#   "Boto3/1.34.0 Python/3.12.0 ..."                     -> "python-sdk"
+#   "aws-cli/2.15.0 Python/3.11.0 ..."                   -> "aws-cli"
+#   "aws-sdk-java/2.20.0 ..."                             -> "java-sdk"
+#   "aws-sdk-go-v2/1.25.0 ..."                            -> "go-sdk"
+#   "APN/1.0 Anthropic/Bedrock ..."                       -> "anthropic-api"
+#   ""                                                     -> "unknown"
+# ---------------------------------------------------------------------------
+short_client_name() {
+    local ua="${1:-}"
+    if [ -z "$ua" ]; then
+        printf 'unknown'
+        return
+    fi
+
+    case "$ua" in
+        claude-cli*|claude-code*)
+            printf 'claude-code'
+            ;;
+        *Boto3*|*botocore*)
+            printf 'python-sdk'
+            ;;
+        aws-cli*)
+            printf 'aws-cli'
+            ;;
+        aws-sdk-js*)
+            printf 'nodejs-sdk'
+            ;;
+        aws-sdk-java*)
+            printf 'java-sdk'
+            ;;
+        aws-sdk-go*)
+            printf 'go-sdk'
+            ;;
+        aws-sdk-ruby*)
+            printf 'ruby-sdk'
+            ;;
+        aws-sdk-dotnet*|aws-sdk-net*)
+            printf 'dotnet-sdk'
+            ;;
+        *Anthropic*|APN/*)
+            printf 'anthropic-api'
+            ;;
+        *)
+            # Extract the first token before / as a fallback
+            local first_token
+            first_token="$(printf '%s' "$ua" | sed 's|/.*||')"
+            if [ -n "$first_token" ] && [ "${#first_token}" -le 20 ]; then
+                printf '%s' "$first_token"
+            else
+                printf 'other'
+            fi
+            ;;
+    esac
+}
+
 # ===========================================================================
 # Subcommand: users
 # ===========================================================================
@@ -112,13 +174,13 @@ cmd_users() {
                 printf '[]\n'
                 ;;
             csv)
-                to_csv "user" "invocations" "top_model"
+                to_csv "user" "invocations" "top_model" "top_client"
                 ;;
         esac
         return 0
     fi
 
-    # Parse each event: extract username and modelId
+    # Parse each event: extract username, modelId, and userAgent
     # CloudTrailEvent is a JSON string that needs to be parsed with fromjson
     local parsed_file="$tmpdir/parsed.json"
     jq -c '
@@ -140,17 +202,18 @@ cmd_users() {
                 ),
                 model: (
                     $ct.requestParameters.modelId // "unknown"
+                ),
+                user_agent: (
+                    $ct.userAgent // "unknown"
                 )
             }
         ]
     ' "$all_events" > "$parsed_file"
 
-    # Apply short_model_name to each model by building a mapping
-    # First, get unique model IDs
+    # Build model name mapping
     local models_file="$tmpdir/models.txt"
     jq -r '[.[].model] | unique | .[]' "$parsed_file" > "$models_file"
 
-    # Build a model name mapping file (model_id<tab>short_name)
     local model_map_file="$tmpdir/model_map.json"
     printf '{' > "$model_map_file"
     local first_map=1
@@ -164,15 +227,36 @@ cmd_users() {
         else
             printf ',' >> "$model_map_file"
         fi
-        # Escape any special characters in keys/values for JSON
         printf '"%s":"%s"' "$raw_model" "$sname" >> "$model_map_file"
     done < "$models_file"
     printf '}' >> "$model_map_file"
 
-    # Aggregate: per user -> total count, and per user per model -> count
-    # Then determine top model per user
+    # Build client name mapping from unique userAgent strings
+    local agents_file="$tmpdir/agents.txt"
+    jq -r '[.[].user_agent] | unique | .[]' "$parsed_file" > "$agents_file"
+
+    local client_map_file="$tmpdir/client_map.json"
+    printf '{' > "$client_map_file"
+    local first_client=1
+    local raw_agent
+    while IFS= read -r raw_agent; do
+        [ -z "$raw_agent" ] && continue
+        local cname
+        cname="$(short_client_name "$raw_agent")"
+        if [ "$first_client" -eq 1 ]; then
+            first_client=0
+        else
+            printf ',' >> "$client_map_file"
+        fi
+        # Use jq to safely encode the key (userAgent can contain special chars)
+        printf '%s' "$raw_agent" | jq -Rc --arg v "$cname" '. as $k | {($k): $v}' \
+            | sed 's/^{//' | sed 's/}$//' >> "$client_map_file"
+    done < "$agents_file"
+    printf '}' >> "$client_map_file"
+
+    # Aggregate: per user -> total count, top model, top client
     local aggregated_file="$tmpdir/aggregated.json"
-    jq -c --slurpfile mmap "$model_map_file" '
+    jq -c --slurpfile mmap "$model_map_file" --slurpfile cmap "$client_map_file" '
         group_by(.user) |
         map({
             user: .[0].user,
@@ -185,9 +269,21 @@ cmd_users() {
                     count: length
                 }) |
                 sort_by(-.count)
+            ),
+            clients: (
+                group_by(.user_agent) |
+                map({
+                    user_agent: .[0].user_agent,
+                    client: ($cmap[0][.[0].user_agent] // "unknown"),
+                    count: length
+                }) |
+                sort_by(-.count)
             )
         }) |
-        map(. + {top_model: .models[0].short_name}) |
+        map(. + {
+            top_model: .models[0].short_name,
+            top_client: .clients[0].client
+        }) |
         sort_by(-.invocations)
     ' "$parsed_file" > "$aggregated_file"
 
@@ -200,7 +296,8 @@ cmd_users() {
         table)
             local col_user=24
             local col_inv=14
-            local col_top=22
+            local col_top=24
+            local col_client=16
 
             printf '\n'
             printf '%s=== Bedrock Usage by User (%s ~ %s) ===%s\n' \
@@ -209,7 +306,8 @@ cmd_users() {
             print_table_header \
                 "User:${col_user}" \
                 "Invocations:${col_inv}" \
-                "Top Model:${col_top}"
+                "Top Model:${col_top}" \
+                "Client:${col_client}"
 
             local count
             count="$(jq 'length' "$aggregated_file")"
@@ -218,25 +316,28 @@ cmd_users() {
                 local row
                 row="$(jq -c ".[$idx]" "$aggregated_file")"
 
-                local uname uinv utop
+                local uname uinv utop uclient
                 uname="$(printf '%s' "$row" | jq -r '.user')"
                 uinv="$(printf '%s' "$row" | jq '.invocations')"
                 utop="$(printf '%s' "$row" | jq -r '.top_model')"
+                uclient="$(printf '%s' "$row" | jq -r '.top_client')"
 
                 print_table_row \
                     "${uname}:${col_user}" \
                     "$(format_number "$uinv"):${col_inv}" \
-                    "${utop}:${col_top}"
+                    "${utop}:${col_top}" \
+                    "${uclient}:${col_client}"
 
                 idx=$((idx + 1))
             done
 
-            print_separator $((col_user + col_inv + col_top))
+            print_separator $((col_user + col_inv + col_top + col_client))
 
             print_table_row \
                 "${BOLD}TOTAL${RESET}:${col_user}" \
                 "$(format_number "$grand_total"):${col_inv}" \
-                ":${col_top}"
+                ":${col_top}" \
+                ":${col_client}"
             printf '\n'
             ;;
         json)
@@ -245,12 +346,14 @@ cmd_users() {
                     user: .user,
                     invocations: .invocations,
                     top_model: .top_model,
-                    models: [.models[] | {model: .short_name, count: .count}]
+                    top_client: .top_client,
+                    models: [.models[] | {model: .short_name, count: .count}],
+                    clients: [.clients[] | {client: .client, count: .count}]
                 })
             ' "$aggregated_file"
             ;;
         csv)
-            to_csv "user" "invocations" "top_model"
+            to_csv "user" "invocations" "top_model" "top_client"
             local count
             count="$(jq 'length' "$aggregated_file")"
             local idx=0
@@ -258,12 +361,13 @@ cmd_users() {
                 local row
                 row="$(jq -c ".[$idx]" "$aggregated_file")"
 
-                local uname uinv utop
+                local uname uinv utop uclient
                 uname="$(printf '%s' "$row" | jq -r '.user')"
                 uinv="$(printf '%s' "$row" | jq '.invocations')"
                 utop="$(printf '%s' "$row" | jq -r '.top_model')"
+                uclient="$(printf '%s' "$row" | jq -r '.top_client')"
 
-                to_csv "$uname" "$uinv" "$utop"
+                to_csv "$uname" "$uinv" "$utop" "$uclient"
                 idx=$((idx + 1))
             done
             ;;

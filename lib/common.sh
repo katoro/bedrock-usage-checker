@@ -404,6 +404,13 @@ short_model_name() {
             ;;
     esac
 
+    # Step 1.5: Strip region prefix (e.g. "us.", "eu.", "ap.") used in cross-region model IDs
+    case "$name" in
+        us.*|eu.*|ap.*)
+            name="${name#*.}"
+            ;;
+    esac
+
     # Step 2: Strip provider prefix (e.g. "anthropic.", "amazon.", "meta.", "cohere.", "ai21.", "mistral.", "stability.")
     case "$name" in
         anthropic.*|amazon.*|meta.*|cohere.*|ai21.*|mistral.*|stability.*)

@@ -206,10 +206,12 @@ generate_date_range_json() {
 }
 
 # ===========================================================================
-# Subcommand: summary
+# _fetch_model_data()
+# Internal: fetch per-model metrics once, write JSON array to given file.
+# Sets _FETCH_TOTAL_INV, _FETCH_TOTAL_INP, _FETCH_TOTAL_OUT, _FETCH_ACTIVE.
 # ===========================================================================
-cmd_summary() {
-    log_info "Fetching summary..."
+_fetch_model_data() {
+    local outfile="$1"
 
     local models
     models="$(get_model_list)" || {
@@ -217,10 +219,12 @@ cmd_summary() {
         return 1
     }
 
-    local total_invocations=0
-    local total_input_tokens=0
-    local total_output_tokens=0
-    local active_models=0
+    printf '[' > "$outfile"
+    local first=1
+    _FETCH_TOTAL_INV=0
+    _FETCH_TOTAL_INP=0
+    _FETCH_TOTAL_OUT=0
+    _FETCH_ACTIVE=0
 
     local model
     while IFS= read -r model; do
@@ -231,45 +235,190 @@ cmd_summary() {
         inp="$(get_metric_sum "$model" "InputTokenCount")"
         out="$(get_metric_sum "$model" "OutputTokenCount")"
 
-        # Accumulate totals (use awk for large-number arithmetic)
-        total_invocations="$(printf '%s %s' "$total_invocations" "$inv" | awk '{printf "%.0f", $1 + $2}')"
-        total_input_tokens="$(printf '%s %s' "$total_input_tokens" "$inp" | awk '{printf "%.0f", $1 + $2}')"
-        total_output_tokens="$(printf '%s %s' "$total_output_tokens" "$out" | awk '{printf "%.0f", $1 + $2}')"
+        _FETCH_TOTAL_INV="$(printf '%s %s' "$_FETCH_TOTAL_INV" "$inv" | awk '{printf "%.0f", $1 + $2}')"
+        _FETCH_TOTAL_INP="$(printf '%s %s' "$_FETCH_TOTAL_INP" "$inp" | awk '{printf "%.0f", $1 + $2}')"
+        _FETCH_TOTAL_OUT="$(printf '%s %s' "$_FETCH_TOTAL_OUT" "$out" | awk '{printf "%.0f", $1 + $2}')"
 
-        # Count active models
         local is_active
         is_active="$(printf '%s' "$inv" | awk '{print ($1 > 0) ? "1" : "0"}')"
         if [ "$is_active" = "1" ]; then
-            active_models=$((active_models + 1))
+            _FETCH_ACTIVE=$((_FETCH_ACTIVE + 1))
         fi
+
+        if [ "$first" -eq 1 ]; then
+            first=0
+        else
+            printf ',' >> "$outfile"
+        fi
+
+        local short_name
+        short_name="$(short_model_name "$model")"
+        printf '{"model_id":"%s","short_name":"%s","invocations":%s,"input_tokens":%s,"output_tokens":%s}' \
+            "$model" "$short_name" "${inv:-0}" "${inp:-0}" "${out:-0}" >> "$outfile"
     done <<EOF
 $models
 EOF
 
+    printf ']' >> "$outfile"
+}
+
+# ===========================================================================
+# _print_summary_table(total_inv, total_inp, total_out, active_models)
+# ===========================================================================
+_print_summary_table() {
+    local total_inv="$1" total_inp="$2" total_out="$3" active="$4"
+    printf '\n'
+    printf '%s=== Bedrock Usage Summary (%s ~ %s) ===%s\n' \
+        "$BOLD" "$START_DATE_SHORT" "$END_DATE_SHORT" "$RESET"
+    printf '\n'
+    printf '  Total Invocations:   %15s\n' "$(format_number "$total_inv")"
+    printf '  Total Input Tokens:  %15s\n' "$(format_number "$total_inp")"
+    printf '  Total Output Tokens: %15s\n' "$(format_number "$total_out")"
+    printf '  Active Models:       %15s\n' "$active"
+    printf '\n'
+}
+
+# ===========================================================================
+# _print_models_table(sorted_json, total_inv, total_inp, total_out)
+# ===========================================================================
+_print_models_table() {
+    local sorted="$1" total_inv="$2" total_inp="$3" total_out="$4"
+    local col_model=40 col_inv=15 col_inp=16 col_out=15
+
+    print_table_header \
+        "Model:${col_model}" \
+        "Invocations:${col_inv}" \
+        "Input Tokens:${col_inp}" \
+        "Output Tokens:${col_out}"
+
+    local count
+    count="$(printf '%s' "$sorted" | jq 'length')"
+    local idx=0
+    while [ "$idx" -lt "$count" ]; do
+        local row
+        row="$(printf '%s' "$sorted" | jq -c ".[$idx]")"
+
+        local sname sinv sinp sout
+        sname="$(printf '%s' "$row" | jq -r '.short_name')"
+        sinv="$(printf '%s' "$row" | jq '.invocations | floor')"
+        sinp="$(printf '%s' "$row" | jq '.input_tokens | floor')"
+        sout="$(printf '%s' "$row" | jq '.output_tokens | floor')"
+
+        print_table_row \
+            "${sname}:${col_model}" \
+            "$(format_number "$sinv"):${col_inv}" \
+            "$(format_number "$sinp"):${col_inp}" \
+            "$(format_number "$sout"):${col_out}"
+
+        idx=$((idx + 1))
+    done
+
+    print_separator $((col_model + col_inv + col_inp + col_out))
+
+    print_table_row \
+        "${BOLD}TOTAL${RESET}:${col_model}" \
+        "$(format_number "$total_inv"):${col_inv}" \
+        "$(format_number "$total_inp"):${col_inp}" \
+        "$(format_number "$total_out"):${col_out}"
+    printf '\n'
+}
+
+# ===========================================================================
+# _print_trend_table(merged_json)
+# ===========================================================================
+_print_trend_table() {
+    local merged="$1"
+    local col_date=14 col_inv=15 col_inp=16 col_out=15
+
+    print_table_header \
+        "Date:${col_date}" \
+        "Invocations:${col_inv}" \
+        "Input Tokens:${col_inp}" \
+        "Output Tokens:${col_out}"
+
+    local max_inv
+    max_inv="$(printf '%s' "$merged" | jq '[.[].invocations] | max // 0')"
+
+    local count
+    count="$(printf '%s' "$merged" | jq 'length')"
+    local idx=0
+    while [ "$idx" -lt "$count" ]; do
+        local row
+        row="$(printf '%s' "$merged" | jq -c ".[$idx]")"
+
+        local d sinv sinp sout
+        d="$(printf '%s' "$row" | jq -r '.date')"
+        sinv="$(printf '%s' "$row" | jq '.invocations | floor')"
+        sinp="$(printf '%s' "$row" | jq '.input_tokens | floor')"
+        sout="$(printf '%s' "$row" | jq '.output_tokens | floor')"
+
+        local bar
+        bar="$(print_bar "$sinv" "$max_inv" 30)"
+
+        printf '%-'"${col_date}"'s%-'"${col_inv}"'s%-'"${col_inp}"'s%-'"${col_out}"'s  %s%s%s\n' \
+            "$d" \
+            "$(format_number "$sinv")" \
+            "$(format_number "$sinp")" \
+            "$(format_number "$sout")" \
+            "$GREEN" "$bar" "$RESET"
+
+        idx=$((idx + 1))
+    done
+    printf '\n'
+}
+
+# ===========================================================================
+# _fetch_trend_data() -> merged JSON
+# ===========================================================================
+_fetch_trend_data() {
+    local daily_inv daily_inp daily_out
+    daily_inv="$(get_metric_daily "Invocations")"
+    daily_inp="$(get_metric_daily "InputTokenCount")"
+    daily_out="$(get_metric_daily "OutputTokenCount")"
+
+    jq -n \
+        --argjson inv "$daily_inv" \
+        --argjson inp "$daily_inp" \
+        --argjson out "$daily_out" '
+        [ range($inv | length) ] | map(
+            {
+                date: $inv[.].date,
+                invocations: ($inv[.].value // 0),
+                input_tokens: ($inp[.].value // 0),
+                output_tokens: ($out[.].value // 0)
+            }
+        )
+    '
+}
+
+# ===========================================================================
+# Subcommand: summary
+# ===========================================================================
+cmd_summary() {
+    log_info "Fetching summary..."
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+    trap "rm -f '$tmpfile'" RETURN
+
+    _fetch_model_data "$tmpfile" || return 1
+
     case "$OUTPUT" in
         table)
-            printf '\n'
-            printf '%s=== Bedrock Usage Summary (%s ~ %s) ===%s\n' \
-                "$BOLD" "$START_DATE_SHORT" "$END_DATE_SHORT" "$RESET"
-            printf '\n'
-            printf '  Total Invocations:   %15s\n' "$(format_number "$total_invocations")"
-            printf '  Total Input Tokens:  %15s\n' "$(format_number "$total_input_tokens")"
-            printf '  Total Output Tokens: %15s\n' "$(format_number "$total_output_tokens")"
-            printf '  Active Models:       %15s\n' "$active_models"
-            printf '\n'
+            _print_summary_table "$_FETCH_TOTAL_INV" "$_FETCH_TOTAL_INP" "$_FETCH_TOTAL_OUT" "$_FETCH_ACTIVE"
             ;;
         json)
             to_json \
                 "period_start=${START_DATE_SHORT}" \
                 "period_end=${END_DATE_SHORT}" \
-                "total_invocations=${total_invocations}" \
-                "total_input_tokens=${total_input_tokens}" \
-                "total_output_tokens=${total_output_tokens}" \
-                "active_models=${active_models}"
+                "total_invocations=${_FETCH_TOTAL_INV}" \
+                "total_input_tokens=${_FETCH_TOTAL_INP}" \
+                "total_output_tokens=${_FETCH_TOTAL_OUT}" \
+                "active_models=${_FETCH_ACTIVE}"
             ;;
         csv)
             to_csv "period_start" "period_end" "total_invocations" "total_input_tokens" "total_output_tokens" "active_models"
-            to_csv "$START_DATE_SHORT" "$END_DATE_SHORT" "$total_invocations" "$total_input_tokens" "$total_output_tokens" "$active_models"
+            to_csv "$START_DATE_SHORT" "$END_DATE_SHORT" "$_FETCH_TOTAL_INV" "$_FETCH_TOTAL_INP" "$_FETCH_TOTAL_OUT" "$_FETCH_ACTIVE"
             ;;
     esac
 }
@@ -280,100 +429,19 @@ EOF
 cmd_models() {
     log_info "Fetching model metrics..."
 
-    local models
-    models="$(get_model_list)" || {
-        log_error "Could not retrieve model list"
-        return 1
-    }
-
-    # Collect per-model data as a JSON array
     local tmpfile
     tmpfile="$(mktemp)"
     trap "rm -f '$tmpfile'" RETURN
 
-    printf '[' > "$tmpfile"
-    local first=1
+    _fetch_model_data "$tmpfile" || return 1
 
-    local model
-    while IFS= read -r model; do
-        [ -z "$model" ] && continue
-
-        local inv inp out
-        inv="$(get_metric_sum "$model" "Invocations")"
-        inp="$(get_metric_sum "$model" "InputTokenCount")"
-        out="$(get_metric_sum "$model" "OutputTokenCount")"
-
-        if [ "$first" -eq 1 ]; then
-            first=0
-        else
-            printf ',' >> "$tmpfile"
-        fi
-
-        local short_name
-        short_name="$(short_model_name "$model")"
-
-        printf '{"model_id":"%s","short_name":"%s","invocations":%s,"input_tokens":%s,"output_tokens":%s}' \
-            "$model" "$short_name" "${inv:-0}" "${inp:-0}" "${out:-0}" >> "$tmpfile"
-    done <<EOF
-$models
-EOF
-
-    printf ']' >> "$tmpfile"
-
-    # Sort by invocations descending
     local sorted
     sorted="$(jq -c 'sort_by(-.invocations)' "$tmpfile")"
 
-    # Compute totals
-    local total_inv total_inp total_out
-    total_inv="$(printf '%s' "$sorted" | jq '[.[].invocations] | add // 0 | floor')"
-    total_inp="$(printf '%s' "$sorted" | jq '[.[].input_tokens] | add // 0 | floor')"
-    total_out="$(printf '%s' "$sorted" | jq '[.[].output_tokens] | add // 0 | floor')"
-
     case "$OUTPUT" in
         table)
-            local col_model=40
-            local col_inv=15
-            local col_inp=16
-            local col_out=15
-
             printf '\n'
-            print_table_header \
-                "Model:${col_model}" \
-                "Invocations:${col_inv}" \
-                "Input Tokens:${col_inp}" \
-                "Output Tokens:${col_out}"
-
-            local count
-            count="$(printf '%s' "$sorted" | jq 'length')"
-            local idx=0
-            while [ "$idx" -lt "$count" ]; do
-                local row
-                row="$(printf '%s' "$sorted" | jq -c ".[$idx]")"
-
-                local sname sinv sinp sout
-                sname="$(printf '%s' "$row" | jq -r '.short_name')"
-                sinv="$(printf '%s' "$row" | jq '.invocations | floor')"
-                sinp="$(printf '%s' "$row" | jq '.input_tokens | floor')"
-                sout="$(printf '%s' "$row" | jq '.output_tokens | floor')"
-
-                print_table_row \
-                    "${sname}:${col_model}" \
-                    "$(format_number "$sinv"):${col_inv}" \
-                    "$(format_number "$sinp"):${col_inp}" \
-                    "$(format_number "$sout"):${col_out}"
-
-                idx=$((idx + 1))
-            done
-
-            print_separator $((col_model + col_inv + col_inp + col_out))
-
-            print_table_row \
-                "${BOLD}TOTAL${RESET}:${col_model}" \
-                "$(format_number "$total_inv"):${col_inv}" \
-                "$(format_number "$total_inp"):${col_inp}" \
-                "$(format_number "$total_out"):${col_out}"
-            printf '\n'
+            _print_models_table "$sorted" "$_FETCH_TOTAL_INV" "$_FETCH_TOTAL_INP" "$_FETCH_TOTAL_OUT"
             ;;
         json)
             printf '%s' "$sorted" | jq '
@@ -415,71 +483,13 @@ EOF
 cmd_trend() {
     log_info "Fetching daily trend..."
 
-    local daily_inv daily_inp daily_out
-    daily_inv="$(get_metric_daily "Invocations")"
-    daily_inp="$(get_metric_daily "InputTokenCount")"
-    daily_out="$(get_metric_daily "OutputTokenCount")"
-
-    # Merge the three metric arrays by date into a single array
     local merged
-    merged="$(jq -n \
-        --argjson inv "$daily_inv" \
-        --argjson inp "$daily_inp" \
-        --argjson out "$daily_out" '
-        [ range($inv | length) ] | map(
-            {
-                date: $inv[.].date,
-                invocations: ($inv[.].value // 0),
-                input_tokens: ($inp[.].value // 0),
-                output_tokens: ($out[.].value // 0)
-            }
-        )
-    ')"
-
-    # Find max invocations for bar scaling
-    local max_inv
-    max_inv="$(printf '%s' "$merged" | jq '[.[].invocations] | max // 0')"
+    merged="$(_fetch_trend_data)"
 
     case "$OUTPUT" in
         table)
-            local col_date=14
-            local col_inv=15
-            local col_inp=16
-            local col_out=15
-
             printf '\n'
-            print_table_header \
-                "Date:${col_date}" \
-                "Invocations:${col_inv}" \
-                "Input Tokens:${col_inp}" \
-                "Output Tokens:${col_out}"
-
-            local count
-            count="$(printf '%s' "$merged" | jq 'length')"
-            local idx=0
-            while [ "$idx" -lt "$count" ]; do
-                local row
-                row="$(printf '%s' "$merged" | jq -c ".[$idx]")"
-
-                local d sinv sinp sout
-                d="$(printf '%s' "$row" | jq -r '.date')"
-                sinv="$(printf '%s' "$row" | jq '.invocations | floor')"
-                sinp="$(printf '%s' "$row" | jq '.input_tokens | floor')"
-                sout="$(printf '%s' "$row" | jq '.output_tokens | floor')"
-
-                local bar
-                bar="$(print_bar "$sinv" "$max_inv" 30)"
-
-                printf '%-'"${col_date}"'s%-'"${col_inv}"'s%-'"${col_inp}"'s%-'"${col_out}"'s  %s%s%s\n' \
-                    "$d" \
-                    "$(format_number "$sinv")" \
-                    "$(format_number "$sinp")" \
-                    "$(format_number "$sout")" \
-                    "$GREEN" "$bar" "$RESET"
-
-                idx=$((idx + 1))
-            done
-            printf '\n'
+            _print_trend_table "$merged"
             ;;
         json)
             printf '%s' "$merged" | jq '
@@ -507,6 +517,98 @@ cmd_trend() {
                 sout="$(printf '%s' "$row" | jq '.output_tokens | floor')"
 
                 to_csv "$d" "$sinv" "$sinp" "$sout"
+                idx=$((idx + 1))
+            done
+            ;;
+    esac
+}
+
+# ===========================================================================
+# Subcommand: overview (summary + models + trend in one pass)
+# ===========================================================================
+cmd_overview() {
+    log_info "Fetching overview..."
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+    trap "rm -f '$tmpfile'" RETURN
+
+    # 1) Fetch model data once (used for summary + models)
+    log_info "  Collecting model metrics..."
+    _fetch_model_data "$tmpfile" || return 1
+
+    local sorted
+    sorted="$(jq -c 'sort_by(-.invocations)' "$tmpfile")"
+
+    # 2) Fetch trend data once
+    log_info "  Collecting daily trend..."
+    local merged
+    merged="$(_fetch_trend_data)"
+
+    # 3) Output everything
+    case "$OUTPUT" in
+        table)
+            _print_summary_table "$_FETCH_TOTAL_INV" "$_FETCH_TOTAL_INP" "$_FETCH_TOTAL_OUT" "$_FETCH_ACTIVE"
+            _print_models_table "$sorted" "$_FETCH_TOTAL_INV" "$_FETCH_TOTAL_INP" "$_FETCH_TOTAL_OUT"
+            _print_trend_table "$merged"
+            ;;
+        json)
+            jq -n \
+                --argjson models "$sorted" \
+                --argjson trend "$merged" \
+                --arg start "$START_DATE_SHORT" \
+                --arg end "$END_DATE_SHORT" \
+                --argjson total_inv "$_FETCH_TOTAL_INV" \
+                --argjson total_inp "$_FETCH_TOTAL_INP" \
+                --argjson total_out "$_FETCH_TOTAL_OUT" \
+                --argjson active "$_FETCH_ACTIVE" '{
+                summary: {
+                    period_start: $start,
+                    period_end: $end,
+                    total_invocations: $total_inv,
+                    total_input_tokens: $total_inp,
+                    total_output_tokens: $total_out,
+                    active_models: $active
+                },
+                models: [$models[] | {
+                    short_name, invocations: (.invocations|floor),
+                    input_tokens: (.input_tokens|floor),
+                    output_tokens: (.output_tokens|floor)
+                }],
+                trend: [$trend[] | {
+                    date, invocations: (.invocations|floor),
+                    input_tokens: (.input_tokens|floor),
+                    output_tokens: (.output_tokens|floor)
+                }]
+            }'
+            ;;
+        csv)
+            printf '# summary\n'
+            to_csv "period_start" "period_end" "total_invocations" "total_input_tokens" "total_output_tokens" "active_models"
+            to_csv "$START_DATE_SHORT" "$END_DATE_SHORT" "$_FETCH_TOTAL_INV" "$_FETCH_TOTAL_INP" "$_FETCH_TOTAL_OUT" "$_FETCH_ACTIVE"
+            printf '\n# models\n'
+            to_csv "short_name" "invocations" "input_tokens" "output_tokens"
+            local count idx row
+            count="$(printf '%s' "$sorted" | jq 'length')"
+            idx=0
+            while [ "$idx" -lt "$count" ]; do
+                row="$(printf '%s' "$sorted" | jq -c ".[$idx]")"
+                to_csv "$(printf '%s' "$row" | jq -r '.short_name')" \
+                       "$(printf '%s' "$row" | jq '.invocations|floor')" \
+                       "$(printf '%s' "$row" | jq '.input_tokens|floor')" \
+                       "$(printf '%s' "$row" | jq '.output_tokens|floor')"
+                idx=$((idx + 1))
+            done
+            printf '\n# trend\n'
+            to_csv "date" "invocations" "input_tokens" "output_tokens"
+            count="$(printf '%s' "$merged" | jq 'length')"
+            idx=0
+            while [ "$idx" -lt "$count" ]; do
+                row="$(printf '%s' "$merged" | jq -c ".[$idx]")"
+                to_csv "$(printf '%s' "$row" | jq -r '.date')" \
+                       "$(printf '%s' "$row" | jq '.invocations|floor')" \
+                       "$(printf '%s' "$row" | jq '.input_tokens|floor')" \
+                       "$(printf '%s' "$row" | jq '.output_tokens|floor')"
                 idx=$((idx + 1))
             done
             ;;

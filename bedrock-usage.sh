@@ -56,11 +56,9 @@ Usage: bedrock-usage.sh [options] <subcommand> [subcommand-options]
 Analyze AWS Bedrock usage, costs, and trends.
 
 Subcommands:
-  summary     Show overall usage summary for the period
-  models      Show per-model usage breakdown
-  users       Show per-user/role usage breakdown
-  trend       Show daily usage trend over the period
-  cost        Show cost analysis and estimates
+  overview    Show summary + models + daily trend in one pass
+  users       Show per-user invocation breakdown with client info
+  cost        Show daily/monthly cost breakdown
   help        Show this help message
 
 Common Options:
@@ -70,10 +68,11 @@ Common Options:
   -h, --help              Show this help message
 
 Examples:
-  bedrock-usage.sh summary
-  bedrock-usage.sh --region us-west-2 --days 30 models
-  bedrock-usage.sh -d 14 -o json trend
+  bedrock-usage.sh overview
+  bedrock-usage.sh overview --days 14
+  bedrock-usage.sh users --days 30
   bedrock-usage.sh cost --days 30
+  bedrock-usage.sh -o json overview
 "
 }
 
@@ -165,17 +164,11 @@ fi
 # Dispatch to subcommand
 # ---------------------------------------------------------------------------
 case "${SUBCOMMAND}" in
-    summary)
-        cmd_summary "$@"
-        ;;
-    models)
-        cmd_models "$@"
+    overview)
+        cmd_overview "$@"
         ;;
     users)
         cmd_users "$@"
-        ;;
-    trend)
-        cmd_trend "$@"
         ;;
     cost)
         cmd_cost "$@"
